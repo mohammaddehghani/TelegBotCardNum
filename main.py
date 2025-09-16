@@ -88,7 +88,7 @@ FIELD_CARD_IMAGE = "تصویر کارت"
     EDIT_ACCOUNT_SELECT_FIELD,
     EDIT_ACCOUNT_GET_NEW_VALUE,
 
-) = range(19)
+) = range(20)
 
 
 # --- Database Section ---
