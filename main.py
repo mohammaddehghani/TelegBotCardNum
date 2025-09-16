@@ -1,634 +1,539 @@
-import logging
 import os
+import logging
 import psycopg2
+from psycopg2 import pool
+from urllib.parse import urlparse
 from dotenv import load_dotenv
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
     MessageHandler,
-    ContextTypes,
     filters,
+    ConversationHandler,
+    ContextTypes,
 )
 
-# --- Load Environment Variables & Basic Config ---
+# ==============================================================================
+# بخش ۱: تنظیمات اولیه و دیتابیس
+# ==============================================================================
+
+# --- راه‌اندازی اولیه ---
 load_dotenv()
-BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-ADMIN_ID_STR = os.getenv('ADMIN_ID')
-DATABASE_URL = os.getenv('DATABASE_URL')
+TOKEN = os.getenv("TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-if not all([BOT_TOKEN, ADMIN_ID_STR, DATABASE_URL]):
-    raise ValueError("One or more environment variables (TELEGRAM_BOT_TOKEN, ADMIN_ID, DATABASE_URL) are missing.")
-if not ADMIN_ID_STR.isdigit():
-    raise ValueError("ADMIN_ID must be a number.")
-ADMIN_ID = int(ADMIN_ID_STR)
-
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+# --- لاگ‌گیری برای دیباگ ---
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# --- Conversation States ---
-(ADD_SELECT_PERSON, ADD_NEW_PERSON, ADD_SELECT_BANK, ADD_NEW_BANK, ADD_GET_NICKNAME, 
- ADD_GET_ACCOUNT_NUM, ADD_GET_CARD_NUM, ADD_GET_SHABA, ADD_GET_IS_SPECIAL, ADD_CONFIRM) = range(10)
+# --- مدیریت اتصال به دیتابیس ---
+try:
+    db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
+    logger.info("✅ اتصال به استخر دیتابیس PostgreSQL با موفقیت برقرار شد.")
+except psycopg2.OperationalError as e:
+    logger.error(f"❌ خطا در اتصال به دیتابیس: {e}")
+    db_pool = None
 
-(EDIT_SELECT_PERSON, EDIT_SELECT_BANK, EDIT_SELECT_ACCOUNT, EDIT_SHOW_OPTIONS, 
- EDIT_PROMPT_VALUE, EDIT_GET_VALUE, EDIT_DELETE_PROMPT, EDIT_DELETE_CONFIRM) = range(10, 18)
+def get_db_conn():
+    if db_pool:
+        return db_pool.getconn()
+    return None
 
-GET_USER_ID_FOR_APPROVAL = 18
+def put_db_conn(conn):
+    if db_pool:
+        db_pool.putconn(conn)
 
-# --- Database Functions ---
-def get_db_connection():
-    try:
-        return psycopg2.connect(DATABASE_URL)
-    except psycopg2.OperationalError as e:
-        logger.error(f"DB Connection Error: {e}")
-        return None
+# --- توابع مدیریت دیتابیس ---
 
-def init_db():
-    conn = get_db_connection()
-    if not conn: return
-    with conn.cursor() as cur:
-        cur.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, first_name VARCHAR(255), username VARCHAR(255), is_approved BOOLEAN DEFAULT FALSE);")
-        cur.execute("CREATE TABLE IF NOT EXISTS persons (id SERIAL PRIMARY KEY, name VARCHAR(255) UNIQUE NOT NULL);")
-        cur.execute("CREATE TABLE IF NOT EXISTS banks (id SERIAL PRIMARY KEY, name VARCHAR(255) UNIQUE NOT NULL);")
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS accounts (
-                id SERIAL PRIMARY KEY, person_id INTEGER REFERENCES persons(id) ON DELETE CASCADE, bank_id INTEGER REFERENCES banks(id) ON DELETE CASCADE,
-                nickname VARCHAR(255), account_number VARCHAR(255), card_number VARCHAR(255), shaba_number VARCHAR(255), is_special BOOLEAN DEFAULT FALSE,
-                UNIQUE(person_id, bank_id, nickname));
-        """)
-        conn.commit()
-    conn.close()
-    logger.info("Database initialized.")
-
-# --- Helper & Permission Functions ---
-def is_admin(user_id: int) -> bool: return user_id == ADMIN_ID
-def is_approved_user(user_id: int) -> bool:
-    if is_admin(user_id): return True
-    conn = get_db_connection()
-    if not conn: return False
-    with conn.cursor() as cur:
-        cur.execute("SELECT is_approved FROM users WHERE user_id = %s", (user_id,))
-        result = cur.fetchone()
-    conn.close()
-    return result[0] if result else False
-
-# --- Generic Cancel ---
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await show_main_menu(update, context, "عملیات لغو شد و به منوی اصلی بازگشتید.")
-    context.user_data.clear()
-    return ConversationHandler.END
-
-# --- Main Menu & Start Command ---
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, message_text="... به منوی اصلی بازگشتید ..."):
-    chat_id = update.effective_chat.id
-    keyboard = [
-        [InlineKeyboardButton("👤 مشاهده اطلاعات", callback_data='view_info_persons')],
-        [InlineKeyboardButton("➕ افزودن اطلاعات", callback_data='add_start')],
-        [InlineKeyboardButton("📝 ویرایش اطلاعات", callback_data='edit_start')],
-    ]
-    if is_admin(chat_id):
-        keyboard.append([InlineKeyboardButton("⚙️ مدیریت کاربران", callback_data='admin_menu')])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    # Try to edit the existing message, otherwise send a new one
-    if update.callback_query:
-        try:
-            await update.callback_query.edit_message_text(text=message_text, reply_markup=reply_markup)
-        except Exception:
-            await context.bot.send_message(chat_id=chat_id, text=message_text, reply_markup=reply_markup)
-    else:
-        await context.bot.send_message(chat_id=chat_id, text=message_text, reply_markup=reply_markup)
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_approved_user(user.id):
-        conn = get_db_connection()
-        if not conn:
-            await update.message.reply_text("❌ خطای دیتابیس.")
-            return
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO users (user_id, first_name, username, is_approved) VALUES (%s, %s, %s, %s) ON CONFLICT (user_id) DO NOTHING", (user.id, user.first_name, user.username, False))
-            conn.commit()
-        conn.close()
-        await context.bot.send_message(chat_id=ADMIN_ID, text=f"کاربر جدید: {user.full_name} (`{user.id}`) @{user.username or 'ندارد'}", parse_mode='Markdown')
-        await update.message.reply_text("درخواست شما برای استفاده از ربات ثبت شد. لطفاً منتظر تایید ادمین بمانید.")
-    else:
-        await show_main_menu(update, context, "سلام! به ربات مدیریت حساب خوش آمدید.")
-
-# --- VIEW INFORMATION FLOW ---
-async def view_select_person(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    conn = get_db_connection()
-    if not conn: return
-    with conn.cursor() as cur:
-        cur.execute("SELECT id, name FROM persons ORDER BY name")
-        persons = cur.fetchall()
-    conn.close()
-
-    if not persons:
-        await query.edit_message_text("هیچ شخصی ثبت نشده است.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(" بازگشت", callback_data='main_menu')]]))
-        return
-
-    keyboard = [[InlineKeyboardButton(p[1], callback_data=f'view_person_{p[0]}')] for p in persons]
-    keyboard.append([InlineKeyboardButton(" بازگشت به منوی اصلی", callback_data='main_menu')])
-    await query.edit_message_text("اطلاعات کدام شخص را می‌خواهید مشاهده کنید؟", reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def view_person_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    person_id = int(query.data.split('_')[2])
-    context.user_data['view_person_id'] = person_id
-
-    conn = get_db_connection()
-    if not conn: return
-    with conn.cursor() as cur:
-        cur.execute("SELECT b.name, a.nickname, a.account_number, a.card_number, a.shaba_number FROM accounts a JOIN banks b ON a.bank_id = b.id WHERE a.person_id = %s AND a.is_special = TRUE ORDER BY b.name, a.nickname;", (person_id,))
-        special_accounts = cur.fetchall()
-        
-        cur.execute("SELECT DISTINCT b.id, b.name FROM accounts a JOIN banks b ON a.bank_id = b.id WHERE a.person_id = %s AND a.is_special = FALSE ORDER BY b.name;", (person_id,))
-        banks = cur.fetchall()
-    conn.close()
-
-    message_text = "حساب‌های با کاربرد خاص:\n\n" if special_accounts else "این شخص حساب با کاربرد خاص ندارد.\n\n"
-    for acc in special_accounts:
-        message_text += f"🏦 **{acc[0]} - {acc[1]}**\nشماره حساب: `{acc[2] or 'N/A'}`\nشماره کارت: `{acc[3] or 'N/A'}`\nشماره شبا: `{acc[4] or 'N/A'}`\n---\n"
-    
-    keyboard = [[InlineKeyboardButton(b[1], callback_data=f'view_bank_{b[0]}')] for b in banks]
-    keyboard.append([InlineKeyboardButton(" بازگشت به لیست اشخاص", callback_data='view_info_persons')])
-    keyboard.append([InlineKeyboardButton(" بازگشت به منوی اصلی", callback_data='main_menu')])
-    
-    message_text += "برای مشاهده حساب‌های عادی، یک بانک را انتخاب کنید:"
-    await query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-
-async def view_bank_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    bank_id = int(query.data.split('_')[2])
-    person_id = context.user_data.get('view_person_id')
-
-    conn = get_db_connection()
-    if not conn: return
-    with conn.cursor() as cur:
-        cur.execute("SELECT b.name, a.nickname, a.account_number, a.card_number, a.shaba_number FROM accounts a JOIN banks b ON a.bank_id = b.id WHERE a.person_id = %s AND a.bank_id = %s AND a.is_special = FALSE ORDER BY a.nickname;", (person_id, bank_id))
-        accounts = cur.fetchall()
-    conn.close()
-
-    message_text = f"حساب‌های عادی در **{accounts[0][0]}**:\n\n"
-    for acc in accounts:
-        message_text += f"👤 **{acc[1]}**\nشماره حساب: `{acc[2] or 'N/A'}`\nشماره کارت: `{acc[3] or 'N/A'}`\nشماره شبا: `{acc[4] or 'N/A'}`\n---\n"
-    
-    keyboard = [[InlineKeyboardButton(" بازگشت به لیست بانک‌ها", callback_data=f'view_person_{person_id}')], [InlineKeyboardButton(" بازگشت به منوی اصلی", callback_data='main_menu')]]
-    await query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-
-# --- ADD INFORMATION CONVERSATION ---
-async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    conn = get_db_connection()
-    if not conn: return ConversationHandler.END
-    with conn.cursor() as cur:
-        cur.execute("SELECT id, name FROM persons ORDER BY name")
-        persons = cur.fetchall()
-    conn.close()
-    
-    keyboard = [[InlineKeyboardButton(p[1], callback_data=f'add_person_{p[0]}')] for p in persons]
-    keyboard.append([InlineKeyboardButton("➕ افزودن شخص جدید", callback_data='add_person_new')])
-    keyboard.append([InlineKeyboardButton("لغو", callback_data='cancel')])
-    await query.edit_message_text("حساب برای کدام شخص است؟", reply_markup=InlineKeyboardMarkup(keyboard))
-    return ADD_SELECT_PERSON
-
-async def add_select_person(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    person_id = int(query.data.split('_')[2])
-    context.user_data['person_id'] = person_id
-    
-    conn = get_db_connection()
-    if not conn: return ConversationHandler.END
-    with conn.cursor() as cur:
-        cur.execute("SELECT id, name FROM banks ORDER BY name")
-        banks = cur.fetchall()
-    conn.close()
-    
-    keyboard = [[InlineKeyboardButton(b[1], callback_data=f'add_bank_{b[0]}')] for b in banks]
-    keyboard.append([InlineKeyboardButton("➕ افزودن بانک جدید", callback_data='add_bank_new')])
-    keyboard.append([InlineKeyboardButton("لغو", callback_data='cancel')])
-    await query.edit_message_text("کدام بانک؟", reply_markup=InlineKeyboardMarkup(keyboard))
-    return ADD_SELECT_BANK
-
-async def add_prompt_new_person(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.edit_message_text("نام شخص جدید را وارد کنید:")
-    return ADD_NEW_PERSON
-
-async def add_save_new_person(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    person_name = update.message.text.strip()
-    conn = get_db_connection()
-    if not conn: return ConversationHandler.END
-    with conn.cursor() as cur:
-        try:
-            cur.execute("INSERT INTO persons (name) VALUES (%s) RETURNING id", (person_name,))
-            person_id = cur.fetchone()[0]
-            conn.commit()
-            context.user_data['person_id'] = person_id
-        except psycopg2.IntegrityError:
-            await update.message.reply_text("این نام قبلاً ثبت شده. لطفاً دوباره تلاش کنید.")
-            return ADD_NEW_PERSON
-    conn.close()
-    
-    # Continue to bank selection
-    return await add_select_person(update, context) # This needs a fake Update object for query
-    # A better way:
-    conn = get_db_connection()
-    if not conn: return ConversationHandler.END
-    with conn.cursor() as cur:
-        cur.execute("SELECT id, name FROM banks ORDER BY name")
-        banks = cur.fetchall()
-    conn.close()
-    keyboard = [[InlineKeyboardButton(b[1], callback_data=f'add_bank_{b[0]}')] for b in banks]
-    keyboard.append([InlineKeyboardButton("➕ افزودن بانک جدید", callback_data='add_bank_new')])
-    keyboard.append([InlineKeyboardButton("لغو", callback_data='cancel')])
-    await update.message.reply_text("کدام بانک؟", reply_markup=InlineKeyboardMarkup(keyboard))
-    return ADD_SELECT_BANK
-
-
-async def add_select_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    context.user_data['bank_id'] = int(query.data.split('_')[2])
-    await query.edit_message_text("یک نام مستعار برای این حساب وارد کنید (مثلا: حقوق، پس‌انداز):")
-    return ADD_GET_NICKNAME
-
-async def add_prompt_new_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.edit_message_text("نام بانک جدید را وارد کنید:")
-    return ADD_NEW_BANK
-
-async def add_save_new_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bank_name = update.message.text.strip()
-    conn = get_db_connection()
-    if not conn: return ConversationHandler.END
-    with conn.cursor() as cur:
-        try:
-            cur.execute("INSERT INTO banks (name) VALUES (%s) RETURNING id", (bank_name,))
-            bank_id = cur.fetchone()[0]
-            conn.commit()
-            context.user_data['bank_id'] = bank_id
-        except psycopg2.IntegrityError:
-            await update.message.reply_text("این بانک قبلاً ثبت شده. لطفاً دوباره تلاش کنید.")
-            return ADD_NEW_BANK
-    conn.close()
-    await update.message.reply_text("یک نام مستعار برای این حساب وارد کنید (مثلا: حقوق، پس‌انداز):")
-    return ADD_GET_NICKNAME
-
-async def add_get_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['nickname'] = update.message.text.strip()
-    await update.message.reply_text("شماره حساب را وارد کنید (برای رد شدن /skip):")
-    return ADD_GET_ACCOUNT_NUM
-
-async def add_get_account_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['account_number'] = None if update.message.text.lower() == '/skip' else update.message.text.strip()
-    await update.message.reply_text("شماره کارت را وارد کنید (برای رد شدن /skip):")
-    return ADD_GET_CARD_NUM
-
-async def add_get_card_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['card_number'] = None if update.message.text.lower() == '/skip' else update.message.text.strip()
-    await update.message.reply_text("شماره شبا (بدون IR) را وارد کنید (برای رد شدن /skip):")
-    return ADD_GET_SHABA
-
-async def add_get_shaba(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['shaba_number'] = None if update.message.text.lower() == '/skip' else update.message.text.strip()
-    keyboard = [[InlineKeyboardButton("بله", callback_data='add_special_yes'), InlineKeyboardButton("خیر", callback_data='add_special_no')]]
-    await update.message.reply_text("آیا این حساب کاربرد خاص دارد؟ (در لیست اصلی نمایش داده شود)", reply_markup=InlineKeyboardMarkup(keyboard))
-    return ADD_GET_IS_SPECIAL
-
-async def add_get_is_special(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    context.user_data['is_special'] = (query.data == 'add_special_yes')
-    
-    # Confirmation Step
-    ud = context.user_data
-    text = (f"اطلاعات زیر ثبت شود؟\n\n"
-            f"شخص: (ID: {ud['person_id']})\n"
-            f"بانک: (ID: {ud['bank_id']})\n"
-            f"نام مستعار: {ud['nickname']}\n"
-            f"شماره حساب: `{ud.get('account_number') or 'N/A'}`\n"
-            f"شماره کارت: `{ud.get('card_number') or 'N/A'}`\n"
-            f"شبا: `{ud.get('shaba_number') or 'N/A'}`\n"
-            f"کاربرد خاص: {'بله' if ud['is_special'] else 'خیر'}")
-            
-    keyboard = [[InlineKeyboardButton("✅ تایید و ذخیره", callback_data='add_confirm_save'), InlineKeyboardButton("❌ لغو", callback_data='cancel')]]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-    return ADD_CONFIRM
-
-async def add_save_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ud = context.user_data
-    conn = get_db_connection()
+def create_tables():
+    """جداول مورد نیاز را در صورت عدم وجود ایجاد می‌کند."""
+    conn = get_db_conn()
     if not conn:
-        await update.callback_query.edit_message_text("❌ خطای دیتابیس.")
-        return ConversationHandler.END
-        
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    first_name VARCHAR(255) NOT NULL,
+                    is_admin BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS persons (
+                    person_id SERIAL PRIMARY KEY,
+                    name VARCHAR(255) UNIQUE NOT NULL
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS banks (
+                    bank_id SERIAL PRIMARY KEY,
+                    name VARCHAR(255) UNIQUE NOT NULL
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS accounts (
+                    account_id SERIAL PRIMARY KEY,
+                    person_id INTEGER REFERENCES persons(person_id) ON DELETE CASCADE,
+                    bank_id INTEGER REFERENCES banks(bank_id) ON DELETE CASCADE,
+                    card_number VARCHAR(16) UNIQUE NOT NULL,
+                    sheba VARCHAR(24) UNIQUE,
+                    is_special BOOLEAN DEFAULT FALSE
+                );
+            """)
+            conn.commit()
+            logger.info("جداول با موفقیت بررسی و ایجاد شدند.")
+    finally:
+        put_db_conn(conn)
+
+def add_user_if_not_exists(user_id, first_name):
+    """یک کاربر جدید را در صورت عدم وجود اضافه می‌کند."""
+    conn = get_db_conn()
+    if not conn: return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
+            if cur.fetchone():
+                return False
+            cur.execute("INSERT INTO users (user_id, first_name) VALUES (%s, %s)", (user_id, first_name))
+            conn.commit()
+            return True
+    finally:
+        put_db_conn(conn)
+
+def get_all_users():
+    conn = get_db_conn()
+    if not conn: return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id, first_name FROM users ORDER BY created_at DESC")
+            return cur.fetchall()
+    finally:
+        put_db_conn(conn)
+
+def add_person(name):
+    conn = get_db_conn()
+    if not conn: return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO persons (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (name,))
+            conn.commit()
+            return cur.rowcount > 0
+    finally:
+        put_db_conn(conn)
+
+def get_all_persons():
+    conn = get_db_conn()
+    if not conn: return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT person_id, name FROM persons ORDER BY name")
+            return cur.fetchall()
+    finally:
+        put_db_conn(conn)
+
+def get_person_id_by_name(name):
+    conn = get_db_conn()
+    if not conn: return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT person_id FROM persons WHERE name = %s", (name,))
+            result = cur.fetchone()
+            return result[0] if result else None
+    finally:
+        put_db_conn(conn)
+
+def add_bank(name):
+    conn = get_db_conn()
+    if not conn: return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO banks (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (name,))
+            conn.commit()
+            return cur.rowcount > 0
+    finally:
+        put_db_conn(conn)
+
+def get_all_banks():
+    conn = get_db_conn()
+    if not conn: return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT bank_id, name FROM banks ORDER BY name")
+            return cur.fetchall()
+    finally:
+        put_db_conn(conn)
+
+def get_bank_id_by_name(name):
+    conn = get_db_conn()
+    if not conn: return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT bank_id FROM banks WHERE name = %s", (name,))
+            result = cur.fetchone()
+            return result[0] if result else None
+    finally:
+        put_db_conn(conn)
+
+def add_account(person_id, bank_id, card_number, sheba, is_special):
+    conn = get_db_conn()
+    if not conn: return False
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO accounts (person_id, bank_id, nickname, account_number, card_number, shaba_number, is_special) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                (ud['person_id'], ud['bank_id'], ud['nickname'], ud.get('account_number'), ud.get('card_number'), ud.get('shaba_number'), ud['is_special'])
+                "INSERT INTO accounts (person_id, bank_id, card_number, sheba, is_special) VALUES (%s, %s, %s, %s, %s)",
+                (person_id, bank_id, card_number, sheba, is_special)
             )
             conn.commit()
-    except Exception as e:
-        logger.error(f"Error saving account: {e}")
-        await update.callback_query.edit_message_text("❌ خطایی در ثبت حساب رخ داد. ممکن است نام مستعار تکراری باشد.")
-        context.user_data.clear()
-        return ConversationHandler.END
+            return True
     finally:
-        conn.close()
-    
-    await update.callback_query.edit_message_text("✅ حساب با موفقیت ثبت شد.")
-    await show_main_menu(update, context)
-    context.user_data.clear()
+        put_db_conn(conn)
+
+def get_accounts_by_person(person_id):
+    conn = get_db_conn()
+    if not conn: return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT a.account_id, b.name, a.card_number, a.sheba, a.is_special
+                FROM accounts a
+                JOIN banks b ON a.bank_id = b.bank_id
+                WHERE a.person_id = %s
+            """, (person_id,))
+            return cur.fetchall()
+    finally:
+        put_db_conn(conn)
+
+def get_all_accounts_summary():
+    conn = get_db_conn()
+    if not conn: return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT a.account_id, b.name, a.card_number, p.name
+                FROM accounts a
+                JOIN banks b ON a.bank_id = b.bank_id
+                JOIN persons p ON a.person_id = p.person_id
+                ORDER BY p.name, b.name
+            """)
+            return cur.fetchall()
+    finally:
+        put_db_conn(conn)
+
+def delete_account(account_id):
+    conn = get_db_conn()
+    if not conn: return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM accounts WHERE account_id = %s", (account_id,))
+            conn.commit()
+            return cur.rowcount > 0
+    finally:
+        put_db_conn(conn)
+
+# ==============================================================================
+# بخش ۲: منطق ربات تلگرام
+# ==============================================================================
+
+# --- تعریف State ها برای مکالمات ---
+(
+    ADD_PERSON_NAME,
+    ADD_BANK_NAME,
+    ADD_ACCOUNT_CHOOSE_PERSON, ADD_ACCOUNT_CHOOSE_BANK, ADD_ACCOUNT_CARD_NUMBER, ADD_ACCOUNT_SHEBA, ADD_ACCOUNT_IS_SPECIAL,
+    DELETE_CHOOSE_ACCOUNT, DELETE_CONFIRM,
+    VIEW_INFO_CHOOSE_PERSON,
+) = range(10)
+
+# --- کیبوردها ---
+main_menu_keyboard = [
+    ["➕ افزودن شخص", "🏦 افزودن بانک"],
+    ["📂 افزودن حساب جدید"],
+    ["✏️ ویرایش حساب", "🗑 حذف حساب"],
+    ["📋 مشاهده اطلاعات"],
+    ["👤 مدیریت کاربران (ادمین)"],
+]
+main_kb = ReplyKeyboardMarkup(main_menu_keyboard, resize_keyboard=True)
+back_kb = ReplyKeyboardMarkup([["🔙 بازگشت"]], resize_keyboard=True)
+yes_no_kb = ReplyKeyboardMarkup([["✅ بله"], ["❌ خیر"]], resize_keyboard=True)
+
+# --- توابع عمومی ربات ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    if add_user_if_not_exists(user.id, user.first_name):
+        logger.info(f"کاربر جدید ثبت‌نام کرد: {user.first_name} ({user.id})")
+        await context.bot.send_message(
+            ADMIN_ID, f"👤 کاربر جدید به ربات پیوست: {user.first_name} (ID: `{user.id}`)"
+        )
+    await update.message.reply_text(
+        f"سلام {user.first_name}! به دفترچه بانکی دیجیتال خوش آمدی.", reply_markup=main_kb
+    )
     return ConversationHandler.END
-    
-# --- EDIT INFORMATION CONVERSATION ---
-async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # This is similar to add_start, but for editing
-    query = update.callback_query
-    conn = get_db_connection()
-    if not conn: return ConversationHandler.END
-    with conn.cursor() as cur:
-        cur.execute("SELECT id, name FROM persons ORDER BY name")
-        persons = cur.fetchall()
-    conn.close()
-    
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    await update.message.reply_text("عملیات لغو شد.", reply_markup=main_kb)
+    return ConversationHandler.END
+
+async def back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    await update.message.reply_text("به منوی اصلی بازگشتی.", reply_markup=main_kb)
+    return ConversationHandler.END
+
+# --- افزودن شخص ---
+async def add_person_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("نام شخص جدید را وارد کنید:", reply_markup=back_kb)
+    return ADD_PERSON_NAME
+
+async def add_person_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    person_name = update.message.text
+    if add_person(person_name):
+        await update.message.reply_text(f"✅ شخص «{person_name}» اضافه شد.", reply_markup=main_kb)
+    else:
+        await update.message.reply_text(f"❌ شخص «{person_name}» از قبل وجود دارد.", reply_markup=main_kb)
+    return ConversationHandler.END
+
+# --- افزودن بانک ---
+async def add_bank_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("نام بانک جدید را وارد کنید:", reply_markup=back_kb)
+    return ADD_BANK_NAME
+
+async def add_bank_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    bank_name = update.message.text
+    if add_bank(bank_name):
+        await update.message.reply_text(f"✅ بانک «{bank_name}» اضافه شد.", reply_markup=main_kb)
+    else:
+        await update.message.reply_text(f"❌ بانک «{bank_name}» از قبل وجود دارد.", reply_markup=main_kb)
+    return ConversationHandler.END
+
+# --- افزودن حساب (مکالمه چند مرحله‌ای) ---
+async def add_account_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    persons = get_all_persons()
     if not persons:
-        await query.edit_message_text("هیچ شخصی برای ویرایش وجود ندارد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت", callback_data='main_menu')]]))
+        await update.message.reply_text("❌ ابتدا باید حداقل یک شخص را اضافه کنید.", reply_markup=main_kb)
+        return ConversationHandler.END
+    
+    keyboard = [[p[1]] for p in persons] + [["🔙 بازگشت"]]
+    await update.message.reply_text("حساب برای کدام شخص است؟", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    return ADD_ACCOUNT_CHOOSE_PERSON
+
+async def add_account_choose_person(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    person_name = update.message.text
+    person_id = get_person_id_by_name(person_name)
+    if not person_id:
+        await update.message.reply_text("❌ شخص انتخاب شده معتبر نیست.")
+        return ADD_ACCOUNT_CHOOSE_PERSON
+    
+    context.user_data['person_id'] = person_id
+    banks = get_all_banks()
+    if not banks:
+        await update.message.reply_text("❌ ابتدا باید حداقل یک بانک را اضافه کنید.", reply_markup=main_kb)
         return ConversationHandler.END
         
-    keyboard = [[InlineKeyboardButton(p[1], callback_data=f'edit_person_{p[0]}')] for p in persons]
-    keyboard.append([InlineKeyboardButton("لغو", callback_data='cancel')])
-    await query.edit_message_text("اطلاعات حساب کدام شخص را می‌خواهید ویرایش کنید؟", reply_markup=InlineKeyboardMarkup(keyboard))
-    return EDIT_SELECT_PERSON
+    keyboard = [[b[1]] for b in banks] + [["🔙 بازگشت"]]
+    await update.message.reply_text("کدام بانک؟", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    return ADD_ACCOUNT_CHOOSE_BANK
 
-async def edit_select_person(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    context.user_data['person_id'] = int(query.data.split('_')[2])
+async def add_account_choose_bank(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    bank_name = update.message.text
+    bank_id = get_bank_id_by_name(bank_name)
+    if not bank_id:
+        await update.message.reply_text("❌ بانک انتخاب شده معتبر نیست.")
+        return ADD_ACCOUNT_CHOOSE_BANK
+        
+    context.user_data['bank_id'] = bank_id
+    await update.message.reply_text("شماره کارت (۱۶ رقمی) را وارد کنید:", reply_markup=back_kb)
+    return ADD_ACCOUNT_CARD_NUMBER
+
+async def add_account_card_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    card_number = update.message.text.strip()
+    if not (card_number.isdigit() and len(card_number) == 16):
+        await update.message.reply_text("❌ شماره کارت باید ۱۶ رقم عددی باشد.")
+        return ADD_ACCOUNT_CARD_NUMBER
+
+    context.user_data['card_number'] = card_number
+    await update.message.reply_text("شماره شبا (۲۴ رقم، بدون IR) را وارد کنید:", reply_markup=back_kb)
+    return ADD_ACCOUNT_SHEBA
+
+async def add_account_sheba(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    sheba = update.message.text.strip()
+    if not (sheba.isdigit() and len(sheba) == 24):
+        await update.message.reply_text("❌ شماره شبا باید ۲۴ رقم عددی باشد.")
+        return ADD_ACCOUNT_SHEBA
+
+    context.user_data['sheba'] = sheba
+    await update.message.reply_text("آیا این حساب برای «مصارف خاص» است؟", reply_markup=yes_no_kb)
+    return ADD_ACCOUNT_IS_SPECIAL
+
+async def add_account_is_special(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    is_special = True if update.message.text == "✅ بله" else False
     
-    conn = get_db_connection()
-    if not conn: return ConversationHandler.END
-    with conn.cursor() as cur:
-        cur.execute("SELECT DISTINCT b.id, b.name FROM accounts a JOIN banks b ON a.bank_id = b.id WHERE a.person_id = %s ORDER BY b.name", (context.user_data['person_id'],))
-        banks = cur.fetchall()
-    conn.close()
-
-    if not banks:
-        await query.edit_message_text("هیچ بانکی برای این شخص ثبت نشده.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت", callback_data='edit_start')]]))
-        return EDIT_SELECT_PERSON # Stay in the same state
-
-    keyboard = [[InlineKeyboardButton(b[1], callback_data=f'edit_bank_{b[0]}')] for b in banks]
-    keyboard.append([InlineKeyboardButton("لغو", callback_data='cancel')])
-    await query.edit_message_text("کدام بانک؟", reply_markup=InlineKeyboardMarkup(keyboard))
-    return EDIT_SELECT_BANK
-
-async def edit_select_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    context.user_data['bank_id'] = int(query.data.split('_')[2])
+    add_account(
+        person_id=context.user_data['person_id'],
+        bank_id=context.user_data['bank_id'],
+        card_number=context.user_data['card_number'],
+        sheba=context.user_data['sheba'],
+        is_special=is_special
+    )
     
-    conn = get_db_connection()
-    if not conn: return ConversationHandler.END
-    with conn.cursor() as cur:
-        cur.execute("SELECT id, nickname FROM accounts WHERE person_id = %s AND bank_id = %s ORDER BY nickname", (context.user_data['person_id'], context.user_data['bank_id']))
-        accounts = cur.fetchall()
-    conn.close()
+    await update.message.reply_text("✅ حساب با موفقیت ثبت شد!", reply_markup=main_kb)
+    context.user_data.clear()
+    return ConversationHandler.END
 
-    keyboard = [[InlineKeyboardButton(a[1], callback_data=f'edit_acc_{a[0]}')] for a in accounts]
-    keyboard.append([InlineKeyboardButton("لغو", callback_data='cancel')])
-    await query.edit_message_text("کدام حساب؟", reply_markup=InlineKeyboardMarkup(keyboard))
-    return EDIT_SELECT_ACCOUNT
+# --- مشاهده اطلاعات ---
+async def view_info_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    persons = get_all_persons()
+    if not persons:
+        await update.message.reply_text("❌ هیچ شخصی برای نمایش اطلاعات وجود ندارد.", reply_markup=main_kb)
+        return ConversationHandler.END
 
-async def edit_select_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    account_id = int(query.data.split('_')[2])
-    context.user_data['account_id'] = account_id
-    
-    conn = get_db_connection()
-    if not conn: return ConversationHandler.END
-    with conn.cursor() as cur:
-        cur.execute("SELECT nickname, account_number, card_number, shaba_number, is_special FROM accounts WHERE id = %s", (account_id,))
-        acc = cur.fetchone()
-    conn.close()
-    
-    context.user_data['current_account'] = acc
-    text = (f"اطلاعات فعلی حساب:\n\n"
-            f"نام مستعار: {acc[0]}\n"
-            f"شماره حساب: `{acc[1] or 'N/A'}`\n"
-            f"شماره کارت: `{acc[2] or 'N/A'}`\n"
-            f"شبا: `{acc[3] or 'N/A'}`\n"
-            f"کاربرد خاص: {'بله' if acc[4] else 'خیر'}\n\n"
-            f"چه کاری می‌خواهید انجام دهید؟")
-            
-    keyboard = [
-        [InlineKeyboardButton("ویرایش نام مستعار", callback_data='edit_field_nickname')],
-        [InlineKeyboardButton("ویرایش شماره حساب", callback_data='edit_field_account_number')],
-        [InlineKeyboardButton("ویرایش شماره کارت", callback_data='edit_field_card_number')],
-        [InlineKeyboardButton("ویرایش شبا", callback_data='edit_field_shaba_number')],
-        [InlineKeyboardButton("تغییر وضعیت 'کاربرد خاص'", callback_data='edit_field_is_special')],
-        [InlineKeyboardButton("🗑️ حذف این حساب", callback_data='edit_delete')],
-        [InlineKeyboardButton("بازگشت", callback_data='cancel')]
-    ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-    return EDIT_SHOW_OPTIONS
+    keyboard = [[p[1]] for p in persons] + [["🔙 بازگشت"]]
+    await update.message.reply_text("اطلاعات حساب‌های کدام شخص را می‌خواهید؟", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    return VIEW_INFO_CHOOSE_PERSON
 
-async def edit_prompt_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    field = query.data.split('_')[2]
-    context.user_data['edit_field'] = field
-    
-    if field == 'is_special':
-        current_status = context.user_data['current_account'][4]
-        new_status = not current_status
-        conn = get_db_connection()
-        if not conn: return ConversationHandler.END
-        with conn.cursor() as cur:
-            cur.execute("UPDATE accounts SET is_special = %s WHERE id = %s", (new_status, context.user_data['account_id']))
-            conn.commit()
-        conn.close()
-        await query.edit_message_text(f"✅ وضعیت 'کاربرد خاص' با موفقیت به '{'بله' if new_status else 'خیر'}' تغییر کرد.")
-        await show_main_menu(update, context)
+async def view_info_choose_person(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    person_name = update.message.text
+    person_id = get_person_id_by_name(person_name)
+    if not person_id:
+        await update.message.reply_text("❌ شخص یافت نشد.")
+        return VIEW_INFO_CHOOSE_PERSON
+
+    accounts = get_accounts_by_person(person_id)
+    if not accounts:
+        await update.message.reply_text(f"❌ هیچ حسابی برای «{person_name}» ثبت نشده است.", reply_markup=main_kb)
+        return ConversationHandler.END
+
+    response_message = f"📂 *اطلاعات حساب‌های {person_name}*:\n\n"
+    accounts.sort(key=lambda x: x[4], reverse=True) # مرتب‌سازی بر اساس خاص بودن
+
+    for acc in accounts:
+        bank_name, card_number, sheba, is_special = acc[1], acc[2], acc[3], acc[4]
+        special_tag = "⭐ (خاص)" if is_special else ""
+        # Escape characters for MarkdownV2
+        card_number_md = card_number.replace('-', '\\-')
+        sheba_md = sheba.replace('-', '\\-')
+        
+        response_message += (
+            f"🏦 *{bank_name}* {special_tag}\n"
+            f"💳 شماره کارت: `{card_number_md}`\n"
+            f"🧾 شبا: `IR{sheba_md}`\n"
+            "--------------------\n"
+        )
+
+    await update.message.reply_text(response_message, reply_markup=main_kb, parse_mode='MarkdownV2')
+    return ConversationHandler.END
+
+# --- حذف حساب ---
+async def delete_account_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    accounts = get_all_accounts_summary()
+    if not accounts:
+        await update.message.reply_text("❌ هیچ حسابی برای حذف وجود ندارد.", reply_markup=main_kb)
         return ConversationHandler.END
     
-    prompts = {
-        'nickname': "نام مستعار جدید را وارد کنید:",
-        'account_number': "شماره حساب جدید را وارد کنید (برای خالی کردن /skip):",
-        'card_number': "شماره کارت جدید را وارد کنید (برای خالی کردن /skip):",
-        'shaba_number': "شماره شبای جدید را وارد کنید (برای خالی کردن /skip):",
-    }
-    await query.edit_message_text(prompts[field])
-    return EDIT_GET_VALUE
-
-async def edit_get_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    field = context.user_data['edit_field']
-    new_value = None if update.message.text.lower() == '/skip' else update.message.text.strip()
+    keyboard = [[f"{acc[3]} - {acc[1]} - {acc[2][-4:]}"] for acc in accounts] + [["🔙 بازگشت"]]
+    context.user_data['accounts_list'] = accounts
     
-    conn = get_db_connection()
-    if not conn: return ConversationHandler.END
-    with conn.cursor() as cur:
-        # Using format to build query is safe here because `field` is from our controlled callbacks
-        query = f"UPDATE accounts SET {field} = %s WHERE id = %s"
-        cur.execute(query, (new_value, context.user_data['account_id']))
-        conn.commit()
-    conn.close()
-    
-    await update.message.reply_text("✅ اطلاعات با موفقیت به‌روز شد.")
-    await show_main_menu(update, context)
-    context.user_data.clear()
-    return ConversationHandler.END
+    await update.message.reply_text("کدام حساب را می‌خواهید حذف کنید؟", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    return DELETE_CHOOSE_ACCOUNT
 
-async def edit_delete_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton("✅ بله، حذف کن", callback_data='delete_confirm_yes'), InlineKeyboardButton("❌ خیر، لغو", callback_data='cancel')]]
-    await update.callback_query.edit_message_text("آیا از حذف این حساب اطمینان دارید؟ این عمل غیرقابل بازگشت است.", reply_markup=InlineKeyboardMarkup(keyboard))
-    return EDIT_DELETE_CONFIRM
+async def delete_account_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    selection = update.message.text
+    chosen_account = None
+    for acc in context.user_data['accounts_list']:
+        if selection == f"{acc[3]} - {acc[1]} - {acc[2][-4:]}":
+            chosen_account = acc
+            break
+            
+    if not chosen_account:
+        await update.message.reply_text("❌ انتخاب نامعتبر است.")
+        return DELETE_CHOOSE_ACCOUNT
 
-async def edit_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = get_db_connection()
-    if not conn: return ConversationHandler.END
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM accounts WHERE id = %s", (context.user_data['account_id'],))
-        conn.commit()
-    conn.close()
-    
-    await update.callback_query.edit_message_text("🗑️ حساب با موفقیت حذف شد.")
-    await show_main_menu(update, context)
-    context.user_data.clear()
-    return ConversationHandler.END
+    context.user_data['account_to_delete_id'] = chosen_account[0]
+    await update.message.reply_text(
+        f"آیا از حذف حساب بانک {chosen_account[1]} ({chosen_account[3]}) به شماره کارت منتهی به {chosen_account[2][-4:]} مطمئن هستید؟",
+        reply_markup=yes_no_kb
+    )
+    return DELETE_CONFIRM
 
-# --- ADMIN USER MANAGEMENT ---
-async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("✅ تایید دسترسی", callback_data='admin_grant')],
-        [InlineKeyboardButton("❌ لغو دسترسی", callback_data='admin_revoke')],
-        [InlineKeyboardButton("📋 لیست کاربران", callback_data='admin_list')],
-        [InlineKeyboardButton("بازگشت", callback_data='main_menu')],
-    ]
-    await update.callback_query.edit_message_text("منوی مدیریت کاربران:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def admin_list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = get_db_connection()
-    if not conn: return
-    with conn.cursor() as cur:
-        cur.execute("SELECT user_id, first_name, username, is_approved FROM users ORDER BY user_id")
-        users = cur.fetchall()
-    conn.close()
-    
-    message = "لیست کاربران:\n\n" + "\n".join([f"👤 {u[1]} (`{u[0]}`) - {'✅' if u[3] else '❌'}" for u in users])
-    await update.callback_query.edit_message_text(message, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت", callback_data='admin_menu')]]))
-
-async def admin_prompt_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    action = update.callback_query.data.split('_')[1]
-    context.user_data['admin_action'] = action
-    prompt_text = "شناسه کاربری که می‌خواهید دسترسی‌اش را تایید کنید، وارد نمایید:" if action == 'grant' else "شناسه کاربری که می‌خواهید دسترسی‌اش را لغو کنید، وارد نمایید:"
-    await update.callback_query.edit_message_text(prompt_text)
-    return GET_USER_ID_FOR_APPROVAL
-
-async def admin_process_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        user_id = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text("شناسه نامعتبر است. یک عدد وارد کنید.")
-        return GET_USER_ID_FOR_APPROVAL
-
-    action = context.user_data['admin_action']
-    new_status = (action == 'grant')
-    
-    conn = get_db_connection()
-    if not conn: return ConversationHandler.END
-    with conn.cursor() as cur:
-        cur.execute("UPDATE users SET is_approved = %s WHERE user_id = %s", (new_status, user_id))
-        conn.commit()
-        if cur.rowcount == 0:
-            await update.message.reply_text(f"کاربری با شناسه `{user_id}` یافت نشد.")
+async def delete_account_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == "✅ بله":
+        account_id = context.user_data['account_to_delete_id']
+        if delete_account(account_id):
+            await update.message.reply_text("✅ حساب با موفقیت حذف شد.", reply_markup=main_kb)
         else:
-            status_text = "تایید شد" if new_status else "لغو شد"
-            await update.message.reply_text(f"دسترسی کاربر `{user_id}` با موفقیت {status_text}.")
-            try:
-                user_message = "دسترسی شما به ربات تایید شد. از /start استفاده کنید." if new_status else "دسترسی شما به ربات توسط ادمین لغو شد."
-                await context.bot.send_message(chat_id=user_id, text=user_message)
-            except Exception as e:
-                logger.error(f"Failed to notify user {user_id}: {e}")
-    conn.close()
-
-    await show_main_menu(update, context)
+            await update.message.reply_text("❌ خطایی در حذف حساب رخ داد.", reply_markup=main_kb)
+    else:
+        await update.message.reply_text("عملیات حذف لغو شد.", reply_markup=main_kb)
+        
+    context.user_data.clear()
     return ConversationHandler.END
 
+# --- مدیریت کاربران (فقط ادمین) ---
+async def manage_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔️ شما دسترسی ادمین ندارید.", reply_markup=main_kb)
+        return
 
+    users = get_all_users()
+    if not users:
+        await update.message.reply_text("هیچ کاربری ثبت‌نام نکرده است.", reply_markup=main_kb)
+        return
+        
+    message = "👥 *لیست کاربران ربات*:\n\n"
+    for user in users:
+        message += f"• نام: {user[1]}\n  ID: `{user[0]}`\n"
+        
+    await update.message.reply_text(message, reply_markup=main_kb, parse_mode='MarkdownV2')
+
+async def not_implemented(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("این بخش هنوز پیاده‌سازی نشده است!", reply_markup=main_kb)
+
+# ==============================================================================
+# بخش ۳: اجرای ربات
+# ==============================================================================
 def main() -> None:
-    init_db()
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # --- Conversation Handlers ---
-    add_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(add_start, pattern='^add_start$')],
+    if not db_pool:
+        logger.critical("ربات به دلیل عدم اتصال به دیتابیس، اجرا نمی‌شود.")
+        return
+        
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    # --- تعریف Conversation Handlers ---
+    conv_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex("^➕ افزودن شخص$"), add_person_start),
+            MessageHandler(filters.Regex("^🏦 افزودن بانک$"), add_bank_start),
+            MessageHandler(filters.Regex("^📂 افزودن حساب جدید$"), add_account_start),
+            MessageHandler(filters.Regex("^📋 مشاهده اطلاعات$"), view_info_start),
+            MessageHandler(filters.Regex("^🗑 حذف حساب$"), delete_account_start),
+        ],
         states={
-            ADD_SELECT_PERSON: [
-                CallbackQueryHandler(add_select_person, pattern='^add_person_\\d+$'),
-                CallbackQueryHandler(add_prompt_new_person, pattern='^add_person_new$'),
-            ],
-            ADD_NEW_PERSON: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_save_new_person)],
-            ADD_SELECT_BANK: [
-                CallbackQueryHandler(add_select_bank, pattern='^add_bank_\\d+$'),
-                CallbackQueryHandler(add_prompt_new_bank, pattern='^add_bank_new$'),
-            ],
-            ADD_NEW_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_save_new_bank)],
-            ADD_GET_NICKNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_nickname)],
-            ADD_GET_ACCOUNT_NUM: [MessageHandler(filters.TEXT, add_get_account_num)],
-            ADD_GET_CARD_NUM: [MessageHandler(filters.TEXT, add_get_card_num)],
-            ADD_GET_SHABA: [MessageHandler(filters.TEXT, add_get_shaba)],
-            ADD_GET_IS_SPECIAL: [CallbackQueryHandler(add_get_is_special, pattern='^add_special_(yes|no)$')],
-            ADD_CONFIRM: [CallbackQueryHandler(add_save_account, pattern='^add_confirm_save$')],
+            ADD_PERSON_NAME: [MessageHandler(filters.TEXT & ~filters.Regex("^🔙 بازگشت$"), add_person_name)],
+            ADD_BANK_NAME: [MessageHandler(filters.TEXT & ~filters.Regex("^🔙 بازگشت$"), add_bank_name)],
+            ADD_ACCOUNT_CHOOSE_PERSON: [MessageHandler(filters.TEXT & ~filters.Regex("^🔙 بازگشت$"), add_account_choose_person)],
+            ADD_ACCOUNT_CHOOSE_BANK: [MessageHandler(filters.TEXT & ~filters.Regex("^🔙 بازگشت$"), add_account_choose_bank)],
+            ADD_ACCOUNT_CARD_NUMBER: [MessageHandler(filters.TEXT & ~filters.Regex("^🔙 بازگشت$"), add_account_card_number)],
+            ADD_ACCOUNT_SHEBA: [MessageHandler(filters.TEXT & ~filters.Regex("^🔙 بازگشت$"), add_account_sheba)],
+            ADD_ACCOUNT_IS_SPECIAL: [MessageHandler(filters.Regex("^(✅ بله|❌ خیر)$"), add_account_is_special)],
+            VIEW_INFO_CHOOSE_PERSON: [MessageHandler(filters.TEXT & ~filters.Regex("^🔙 بازگشت$"), view_info_choose_person)],
+            DELETE_CHOOSE_ACCOUNT: [MessageHandler(filters.TEXT & ~filters.Regex("^🔙 بازگشت$"), delete_account_choose)],
+            DELETE_CONFIRM: [MessageHandler(filters.Regex("^(✅ بله|❌ خیر)$"), delete_account_confirm)],
         },
-        fallbacks=[CallbackQueryHandler(cancel, pattern='^cancel$'), CommandHandler('cancel', cancel)],
+        fallbacks=[MessageHandler(filters.Regex("^🔙 بازگشت$"), back), CommandHandler("cancel", cancel)],
+        conversation_timeout=300 # 5 دقیقه
     )
 
-    edit_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(edit_start, pattern='^edit_start$')],
-        states={
-            EDIT_SELECT_PERSON: [CallbackQueryHandler(edit_select_person, pattern='^edit_person_\\d+$')],
-            EDIT_SELECT_BANK: [CallbackQueryHandler(edit_select_bank, pattern='^edit_bank_\\d+$')],
-            EDIT_SELECT_ACCOUNT: [CallbackQueryHandler(edit_select_account, pattern='^edit_acc_\\d+$')],
-            EDIT_SHOW_OPTIONS: [
-                CallbackQueryHandler(edit_prompt_value, pattern='^edit_field_'),
-                CallbackQueryHandler(edit_delete_prompt, pattern='^edit_delete$'),
-            ],
-            EDIT_GET_VALUE: [MessageHandler(filters.TEXT, edit_get_value)],
-            EDIT_DELETE_CONFIRM: [CallbackQueryHandler(edit_delete_confirm, pattern='^delete_confirm_yes$')],
-        },
-        fallbacks=[CallbackQueryHandler(cancel, pattern='^cancel$'), CommandHandler('cancel', cancel)],
-    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(conv_handler)
+    app.add_handler(MessageHandler(filters.Regex("^👤 مدیریت کاربران \(ادمین\)$"), manage_users))
+    app.add_handler(MessageHandler(filters.Regex("^✏️ ویرایش حساب$"), not_implemented))
 
-    admin_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_prompt_user_id, pattern='^admin_(grant|revoke)$')],
-        states={
-            GET_USER_ID_FOR_APPROVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_process_user_id)],
-        },
-        fallbacks=[CallbackQueryHandler(cancel, pattern='^cancel$'), CommandHandler('cancel', cancel)],
-    )
-
-    # --- Add handlers to application ---
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(add_conv)
-    application.add_handler(edit_conv)
-    application.add_handler(admin_conv)
-    
-    # Static menu navigations
-    application.add_handler(CallbackQueryHandler(show_main_menu, pattern='^main_menu$'))
-    application.add_handler(CallbackQueryHandler(admin_menu, pattern='^admin_menu$'))
-    application.add_handler(CallbackQueryHandler(admin_list_users, pattern='^admin_list$'))
-    
-    # View flow
-    application.add_handler(CallbackQueryHandler(view_select_person, pattern='^view_info_persons$'))
-    application.add_handler(CallbackQueryHandler(view_person_details, pattern='^view_person_'))
-    application.add_handler(CallbackQueryHandler(view_bank_accounts, pattern='^view_bank_'))
-
-    # Fallback cancel for conversations
-    application.add_handler(CallbackQueryHandler(cancel, pattern='^cancel$'))
-    
-    # Run the bot
-    application.run_polling()
+    app.run_polling()
 
 if __name__ == "__main__":
+    create_tables()
     main()
